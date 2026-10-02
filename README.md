@@ -394,18 +394,6 @@ the stored data more easily. But our format is already binary, so it would be po
 represent NBT Compounds in binary as well. It is, however, crucial that the interfaces remain intuitive and that
 efficient encoders/decoders are used for the serialization and deserialization of NBT.
 
-### Light Data could be cached
-
-To speed up world loading within the Minecraft server, we could pre-populate light data (sky- and blocklight) and use
-this data to load the world. This only takes a little amount of additional space (which we could even make optional) but
-could possibly drastically improve the world loading performance. In theory, this could even be merged into the world
-when embedding SHARDs as schematics, rendering most (if not all) light updates redundant.
-
-Including light data in SHARDs increases the complexity of most transformation operations and especially the merging of
-SHARDs. To reliably modify light data during those operations, we would need to implement details about how light data
-is populated. That is a huge maintenance burden. Alternatively, we could just drop any light data once a modification
-has been applied to the SHARD.
-
 
 [justchunks-website]: https://justchunks.net/
 
