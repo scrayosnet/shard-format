@@ -1,7 +1,7 @@
-# SHARD Format: Version 0
+# SHARD Format: Version 2
 
 This document defines the data format of the [SHARD (Shard Highly Augmented Region Data) format][shard-format] in
-version 0. It contains the expected data fields and encodings that are necessary to serialize to and deserialize from
+version 2. It contains the expected data fields and encodings that are necessary to serialize to and deserialize from
 SHARD files into their in-memory components. Libraries that want to use SHARDs need to adhere to this specification.
 When in doubt, the reference implementation may be consulted.
 
@@ -70,7 +70,7 @@ position of the hive or whether the bee has lost its sting.
 ### Entity
 
 [Entities][entity-wiki] are single instances of a specific [Entity Type](#entity-type) at a specific position relative
-to the origin of the SHARD. Entities are identified by a [UUID](#uuid) and contain dynamic data, that is based on the
+to the origin of the [Section](#section) that holds them. Entities are identified by a [UUID](#uuid) and contain dynamic data, that is based on the
 [Entity Type](#entity-type). SHARDs don't contain the UUID of entities, so that the platform can assign a new identifier
 according to the rules of this implementation. Most platforms will just generate a random new UUID for each entity. The
 format for all entities can be read in the [Minecraft wiki][entity-format-wiki].
@@ -88,6 +88,14 @@ Config Positions are JustChunk's configuration embed format. They are generated 
 configuration associated with this location. This could, for example, mean some kind of NPC that should be placed there
 while loading the world. When exporting a world, all Config Positions are scanned and extracted, so they don't show up
 as normal entities but instead become part of the world configuration.
+
+### Light
+
+[Light][light-wiki] is the per-block illumination level that Minecraft uses for rendering and game mechanics. Each block
+has a sky light and a block light value, both ranging from `0` (dark) to `15` (fully lit). Sky light originates from the
+open sky, while block light originates from light-emitting blocks like torches. Normally, the client recomputes light
+when a chunk is loaded. A SHARD MAY cache the pre-computed light so that consumers can ship it directly to the client
+instead of recomputing it on load.
 
 ## Endianness
 
@@ -132,9 +140,10 @@ should only contain a single SHARD definition.
 | Name                   | Type                                   | Description                                                        | Notes                                                                                                                                                   |
 |------------------------|----------------------------------------|--------------------------------------------------------------------|---------------------------------------------------------------------------------------------------------------------------------------------------------|
 | Magic Bytes            | Byte[]                                 | Magic Bytes to perform MIME type recognition/integrity check       | Always `SHARD FILE FORMAT` + `0x00` encoded in UTF-8 <br/>(`0x53 0x48 0x41 0x52 0x44 0x20 0x46 0x49 0x4C 0x45 0x20 0x46 0x4F 0x52 0x4D 0x41 0x54 0x00`) |
-| Version                | UByte                                  | Version number to indicate the appropriate codec                   | Always `0` for this version of the specification                                                                                                        |
+| Version                | UByte                                  | Version number to indicate the appropriate codec                   | Always `2` for this version of the specification                                                                                                        |
 | Unique Identifier      | [UUID](#uuid-1)                        | Identifier to unambiguously reference this SHARD                   | Should always change if the level data changes                                                                                                          |
-| Minecraft Data Version | UInt                                   | [Data version][dataversion-wiki] of the contained level data       |                                                                                                                                                         |
+| Minecraft Data Version | UInt                                   | [Data version][dataversion-wiki] of the contained level data       | MUST be greater than `0`; the value is always known at export time, so `0` indicates a malformed SHARD                                                   |
+| Has Cached Light       | Boolean                                | Whether this SHARD carries pre-computed light for its sections      | If true, consumers MAY ship the cached light instead of recomputing it. Derived from whether any section carries non-empty light.                        |
 | Metadata               | [Metadata](#metadata)                  | Visual meta information to describe the content                    |                                                                                                                                                         |
 | Bounds                 | [Bounds](#bounds)                      | Overall dimensions/size of this SHARD across all sections          |                                                                                                                                                         |
 | Config Position Count  | UInt                                   | Amount of Config Positions that are included after this field      |                                                                                                                                                         |
@@ -160,6 +169,17 @@ form takes up significantly more space.
 A metadata object containing the visual metadata that describes the content and origin of the SHARD in a human-readable
 form. This can be used to display the SHARD in menus and print summaries.
 
+Beyond the four fixed fields, the metadata carries an arbitrary `Extra` [Mapping](#mapping) that consumers MAY use to
+attach context which the fixed fields cannot express. Unlike those fields it has no existence flag, as [Mappings](#mapping)
+already encode emptiness in their `Count`. The following rules apply to it:
+
+* Keys SHOULD be namespaced (`jcdungeon:room_tier` instead of `tier`), so that independent consumers writing into the
+  same SHARD cannot collide.
+* Implementations MUST preserve unknown keys across a read/write round trip. This is what makes the mapping usable as
+  an extension point rather than a place where data silently disappears.
+* Deserialization MUST NOT depend on the mapping. A consumer that cannot interpret an attribute MUST still be able to
+  load the SHARD completely. Anything that a reader genuinely requires belongs in a versioned field instead.
+
 | Name                      | Type                | Description                                          | Notes                                                                                                                                 |
 |---------------------------|---------------------|------------------------------------------------------|---------------------------------------------------------------------------------------------------------------------------------------|
 | Name Existence            | Boolean             | Whether the `Name` attribute is set                  |                                                                                                                                       |
@@ -170,6 +190,7 @@ form. This can be used to display the SHARD in menus and print summaries.
 | Creator                   | [UUID](#uuid-1)     | Creator of the SHARD                                 | Only present if `Creator Existence` is true, A [UUID](#uuid) with only zero bits indicates, that this SHARD was created by the system |
 | Creation Moment Existence | Boolean             | Whether the `Creation Moment` attribute is set       |                                                                                                                                       |
 | Creation Moment           | [Instant](#instant) | Exact moment, when this SHARD was originally created | Only present if `Creation Moment Existence` is true                                                                                   |
+| Extra                     | [Mapping](#mapping) | Free-form key-value attributes of the SHARD          | Always present; an empty mapping (`Count` of `0`) means that no attributes are set                                                     |
 
 ### String
 
@@ -217,11 +238,15 @@ position, relative to the origin of the SHARD.
 ### Mapping
 
 A mapping object that contains an arbitrary amount of [Entries](#entry) (key-value pairs). A mapping may also be empty
-or contain up to 256 entries of varying length. Each entry must be unique.
+or contain up to 255 entries of varying length. Each entry must be unique.
 
-| Name    | Type              | Description                                 | Notes |
-|---------|-------------------|---------------------------------------------|-------|
-| Count   | UByte             | Amount of mappings that are present         |       |
+`Count` is unsigned and MUST be widened without sign extension. Implementations up to and including
+[version 1](shard-v1.md) widened it as a signed byte, which silently discarded every entry of a mapping holding more
+than 127 of them.
+
+| Name    | Type              | Description                                 | Notes                                     |
+|---------|-------------------|---------------------------------------------|-------------------------------------------|
+| Count   | UByte             | Amount of mappings that are present         | Unsigned; a mapping holds at most 255 entries |
 | Entries | [Entry](#entry)[] | Individual entries of the key-value mapping |       |
 
 ### Entry
@@ -236,14 +261,16 @@ An entry object that maps a specific value to a specific key. The key or value m
 
 ### Position
 
-A position object that contains a relative offset to the origin of the SHARD. All three axes cannot be negative as that
-would mean they are not included in the SHARD.
+A position object that contains a relative offset to an origin. Which origin that is depends on the object the position
+belongs to and is stated there: [Config Positions](#config-position) are relative to the origin of the SHARD, while
+[Block Entities](#block-entity) and [Entities](#entity) are relative to the origin of the [Section](#section) that
+holds them. All three axes cannot be negative as that would mean they are not included in the enclosing object.
 
-| Name | Type  | Description                                                  | Notes                          |
-|------|-------|--------------------------------------------------------------|--------------------------------|
-| X    | Float | Offset along the x-axis, relative to the origin of the SHARD | Must be positive (including 0) |
-| Y    | Float | Offset along the y-axis, relative to the origin of the SHARD | Must be positive (including 0) |
-| Z    | Float | Offset along the z-axis, relative to the origin of the SHARD | Must be positive (including 0) |
+| Name | Type  | Description                             | Notes                          |
+|------|-------|-----------------------------------------|--------------------------------|
+| X    | Float | Offset along the x-axis from the origin | Must be positive (including 0) |
+| Y    | Float | Offset along the y-axis from the origin | Must be positive (including 0) |
+| Z    | Float | Offset along the z-axis from the origin | Must be positive (including 0) |
 
 ### Palette
 
@@ -284,7 +311,8 @@ of eight sections, and the single mask byte is `0b00011000`, only two sections w
 at the bit indices `3` and `4`), and all other sections should be assumed to be empty.
 
 Only `Complete` sections can be substituted by empty sections. Even if a section is completely empty, it cannot be
-omitted (and will therefore always be present and represented by a `1` bit) if it is not `Complete`.
+omitted (and will therefore always be present and represented by a `1` bit) if it is not `Complete`. Skipped sections
+are also assumed to carry no cached light (both [Light Channels](#light-channel) default to the empty state).
 
 ### Section
 
@@ -296,11 +324,20 @@ The contained block and biome references are ordered from x, to z, to y. That me
 block that is at the relative position `(5, 0, 0)` will have index 5, while `(0, 5, 0)` will have the index `1280`.
 The data type of the block and biome references is set by the corresponding [palette](#palette).
 
+The cached [Sky Light](#light-channel) and [Block Light](#light-channel) are appended after the biomes. Unlike blocks
+and biomes, light is **always** stored for the full `16 * 16 * 16` volume, regardless of the section bounds, and uses a
+different ordering (see [Light Channel](#light-channel)).
+
 Sections are required to be `Complete`, if possible with the remaining blocks. That means only the sections that are
 at the upper edge of the bounds on any (or multiple) of the three axes could possibly be incomplete. A SHARD with the
 size `17 * 17 * 17` would contain one `Complete` section (that's right at the origin) and seven incomplete sections:
 {`1 * 16 * 16`, `16 * 16 * 1`, `1 * 16 * 1`, `16 * 1 * 16`, `1 * 1 * 16`, `16 * 1 * 1`, `1 * 1 * 1`}. Sections are
 always created starting from the origin.
+
+The sections are stored in the order `y -> x -> z`: the y-index varies fastest, then the x-index, then the z-index.
+The index of a section is therefore `y + (x * countY) + (z * countY * countX)`, where `countX`, `countY` and `countZ`
+are the numbers of sections along the respective axes -- each the corresponding [Bounds](#bounds) value of the SHARD
+divided by `16` and rounded up. Note that this differs from the order of the blocks and biomes *within* a section.
 
 | Name                 | Type                              | Description                                                           | Notes                                                                                                                                                                                              |
 |----------------------|-----------------------------------|-----------------------------------------------------------------------|----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
@@ -308,18 +345,39 @@ always created starting from the origin.
 | Bounds               | [Bounds](#bounds)                 | Bounds/Dimensions of this section                                     | Only present if `Complete` is false, maximum of 16 for each axis                                                                                                                                   |
 | Blocks               | UByte[] \| UShort[] \| UInt[]     | References of the blocks of this section                              | Length equals the three axes of the bounds multiplied. Whether a `UByte`, `UShort` or `UInt` is used for each reference, is set by the `Scale` of the block [palette](#palette). Order is x->z->y. |
 | Biomes               | UByte[] \| UShort[] \| UInt[]     | References of the biomes of this section                              | Length equals the three axes of the bounds multiplied. Whether a `UByte`, `UShort` or `UInt` is used for each reference, is set by the `Scale` of the biome [palette](#palette). Order is x->z->y. |
+| Sky Light            | [Light Channel](#light-channel)   | Cached sky light of this section                                     | Always covers the full 16x16x16 volume. See [Light Channel](#light-channel).                                                                                                                       |
+| Block Light          | [Light Channel](#light-channel)   | Cached block light of this section                                   | Always covers the full 16x16x16 volume. See [Light Channel](#light-channel).                                                                                                                       |
 | Block Entities Count | UInt                              | Amount of [block entities](#block-entity-1) included after this field |                                                                                                                                                                                                    |
 | Block Entities       | [Block Entity](#block-entity-1)[] | [Block Entities](#block-entity-1) of this section                     |                                                                                                                                                                                                    |
 | Entities Count       | UInt                              | Amount of [entities](#entity-1) included after this field             |                                                                                                                                                                                                    |
 | Entities             | [Entity](#entity-1)[]             | [Entities](#entity-1) of this section                                 |                                                                                                                                                                                                    |
+
+### Light Channel
+
+A Light Channel holds the cached light (sky or block) of a single [Section](#section). The light is always stored for
+the full `16 * 16 * 16 = 4096` block volume, independent of the section `Bounds`. Each block has a light level between
+`0` and `15`, stored as a single nibble (4 bits), so the full volume fits into exactly `2048` bytes where two
+consecutive blocks share a byte.
+
+The nibble order differs from blocks and biomes: the index of a block is `i = (y << 8) | (z << 4) | x` (order y->z->x).
+The lower nibble of byte `i / 2` holds the value for even indices, the upper nibble holds the value for odd indices.
+
+Most sections share a uniform state and therefore carry no payload. The `State` distinguishes the three cases:
+
+| Name    | Type       | Description                          | Notes                                                                                            |
+|---------|------------|--------------------------------------|--------------------------------------------------------------------------------------------------|
+| State   | UByte      | The kind of light stored             | `0x00` EMPTY (all blocks `0`)<br/>`0x01` FULL (all blocks `15`)<br/>`0x02` EXPLICIT (raw payload) |
+| Payload | Byte[2048] | The raw nibble-packed light values   | Only present if `State` is `0x02` (EXPLICIT). Always exactly `2048` bytes, ordered y->z->x.       |
 
 ### Block Entity
 
 A Block Entity object that contains information on a single instance within a [Section](#section). The position is
 relative to the origin of the section and must be within the bounds of the specific section.
 
-The position tag `Pos` has to be removed from the [SNBT](#snbt) data, as the position is changed within this SHARD. The
-data is instead manually constructed using the new absolute origin with the relative offset.
+The position tag `Pos` MUST NOT be present in the [SNBT](#snbt) data, as the position is changed within this SHARD.
+The `Position` field of this object is the single authority on where the block entity resides, and the absolute
+position is instead constructed by the consumer from the new origin and the relative offset. A writer that emits `Pos`
+anyway produces a second, coarser copy of the position that consumers may disagree about.
 
 | Name     | Type                  | Description                                     | Notes                                                         |
 |----------|-----------------------|-------------------------------------------------|---------------------------------------------------------------|
@@ -343,15 +401,26 @@ taken from the new entity that gets spawned when applying the SHARD to a world:
 * `Spigot.ticksLived`
 * `WorldUUIDMost`
 * `WorldUUIDLeast`
-* `TileX`
-* `TileY`
-* `TileZ`
+
+The anchor block of block-attached entities (paintings, item frames, glow item frames and leash knots) is the
+exception to this. It is stored in the `block_pos` field as an [NBT](#nbt) int array of `[x, y, z]` and MUST be
+retained, converted to an offset relative to the origin of the section that holds the entity -- the same origin the
+`Position` of the entry is relative to. Storing it relative rather than absolute is what allows it to be translated
+and rotated alongside the blocks it is attached to. Whenever an entity is moved into a section with a different origin
+-- when SHARDs are merged, or when a SHARD is pasted at an offset that is not a multiple of the section edge length --
+the anchor MUST be re-based by the same delta as the `Position` of the entry, or the entity ends up detached from the
+block it belongs to. Note that `TileX`, `TileY` and `TileZ` were the representation of this anchor before Minecraft
+1.21.5 and no longer occur.
+
+The [SNBT](#snbt) data of an entity MUST contain an `id`. Entities without one cannot be spawned and cannot be
+converted between Minecraft versions, so they MUST NOT be written into a SHARD. The `id` is also where the type of the
+entity is taken from -- it is not stored separately, as it is the only copy of the type that the Minecraft data
+converter keeps up to date.
 
 | Name     | Type                  | Description                                                                | Notes                                                         |
 |----------|-----------------------|----------------------------------------------------------------------------|---------------------------------------------------------------|
-| Position | [Position](#position) | Relative position within the section                                       | Relative to the section origin, must be within section bounds |
-| Type     | [String](#string)     | [Resource Location](#resource-location) of the [Entity Type](#entity-type) |                                                               |
-| Data     | [String](#string)     | Properties of the entity in [SNBT](#snbt)                                  |                                                               |
+| Position | [Position](#position) | Relative position within the section      | Relative to the section origin, must be within section bounds |
+| Data     | [String](#string)     | Properties of the entity in [SNBT](#snbt) | MUST contain an `id`                                          |
 
 ## Compression
 
@@ -364,6 +433,9 @@ implementation is limited to [zstd][zstd-github] and `.shard.zst`.
 The compression level within each format (if applicable) can be chosen freely. Assumptions must not be made by the
 decompiler, and each decompiler is expected to at least support any configuration of zstd compression. Other formats may
 be supported.
+
+The [Light Channel](#light-channel) payloads are stored raw and rely on the container compression. The uniform `EMPTY`
+and `FULL` states already avoid storing redundant payloads, so explicit per-payload compression is unnecessary.
 
 
 [shard-format]: README.md
@@ -389,6 +461,8 @@ be supported.
 [entity-wiki]: https://minecraft.wiki/w/Entity
 
 [entity-format-wiki]: https://minecraft.wiki/w/Entity_format
+
+[light-wiki]: https://minecraft.wiki/w/Light
 
 [byteorder-wiki]: https://en.wikipedia.org/wiki/Endianness
 

@@ -221,6 +221,18 @@ previous versions referred to block types by a numeric ID and another numeric su
 would incur a lot of complexities on our data schema as well as the code for transformations. Therefore, we will always
 only support the latest version of Minecraft's internal data scheme, but provide upgrade paths.
 
+### Record where a SHARD was exported from
+
+A SHARD does not store the origin of the world it was captured in, and it never will. The tempting use for such an
+origin would be to repair the NBT fields that hold an absolute coordinate rather than a relative one
+(`end_gateway.exit_portal`, `beehive.flower_pos`, lodestone targets, `home_pos`, …) by shifting them into the world the
+SHARD is placed in. That does not actually work. References that point *inside* the SHARD are far better served by
+relativizing the field at capture time, the way the anchor of block-attached entities already is — a relative field also
+survives a rotation, which an origin delta does not. References that point *outside* the SHARD cannot be repaired by
+anything: shifting them yields a position that addresses whatever happens to occupy that spot in the target world, which
+is worse than a pointer that is obviously stale. What would be left is permanent world context inside a format whose
+whole point is to be independent of any particular world.
+
 ### Human Readability
 
 As the SHARD format is a binary format, human readability cannot be achieved. Instead, we rely on tooling to allow
@@ -245,6 +257,15 @@ sections are culled from the final result. The transformation supports an arbitr
 of another with positive and negative offsets. The SHARD is grown to support all blocks at their respective offsets, and
 entities can be purged on lower layers or just added to the existing entities.
 
+A merge moves entities into sections whose origin differs from the one they were captured against, and the two only
+coincide when the offset of a layer happens to be a multiple of the section edge length. The position of an entry is
+re-based by the merge itself, but coordinates that live *inside* the NBT and share that origin — the anchor of
+block-attached entities is the only one in practice — cannot be, because the format treats the NBT as an opaque string
+and carries no parser for it. The merge therefore accepts a hook that the consumer supplies to perform the rewrite. A
+consumer that recomputes such anchors from the position of the entry anyway does not need one; a consumer that trusts
+the stored anchor and skips the hook ends up with paintings and item frames hanging on the wrong block — quietly, as
+an offset of a few blocks still falls within the tolerance the game accepts when it loads such an entity.
+
 ### Rotation
 
 Sometimes the orientation of SHARDs does not match the orientation that they should have in the world. Shards can be
@@ -252,6 +273,13 @@ rotated around all three axes in steps of 90 degrees. While other angles would a
 scope of SHARDs, as that would require some kind of interpolation, and we focus on clean transformations. The blocks in
 the palette are also rotated accordingly (if possible for this angle) and the dimensions of the SHARD are adjusted to
 match the new orientation.
+
+Entities are rotated around the same center as the blocks, and the ones that are attached to a block need more than a
+new position. Their visible placement is derived entirely from their anchor and the direction they face, so both have to
+turn with the blocks around them. The two families store that direction differently: paintings keep a horizontal
+direction, while item frames can also sit on a floor or a ceiling and therefore keep a full three-dimensional one under
+a key of their own. An implementation that only handles the first leaves every item frame pointing the way it did
+before, in the middle of a structure that has turned around it.
 
 ### No-Op
 
@@ -316,9 +344,11 @@ To allow an easier distinction between the different changes from one version to
 this table holds all published versions of the SHARD format so far. Once a new version is released, a new specification
 is added to this repository, and it is referenced within the table below.
 
-| Version          | Name    | Date       | Note            |
-|------------------|---------|------------|-----------------|
-| [0](shard-v0.md) | initial | 2023-06-17 | Initial version |
+| Version          | Name    | Date       | Note                                          |
+|------------------|---------|------------|-----------------------------------------------|
+| [0](shard-v0.md) | initial | 2023-06-17 | Initial version                               |
+| [1](shard-v1.md) | light   | 2026-06-20 | Optional cached sky and block light           |
+| [2](shard-v2.md) | extra   | 2026-08-23 | Free-form extra metadata, entity type dropped |
 
 ## Optimization Possibilities
 
@@ -363,18 +393,6 @@ We made this decision to write easier migrations across different data versions 
 the stored data more easily. But our format is already binary, so it would be possible (and probably desirable) to
 represent NBT Compounds in binary as well. It is, however, crucial that the interfaces remain intuitive and that
 efficient encoders/decoders are used for the serialization and deserialization of NBT.
-
-### Light Data could be cached
-
-To speed up world loading within the Minecraft server, we could pre-populate light data (sky- and blocklight) and use
-this data to load the world. This only takes a little amount of additional space (which we could even make optional) but
-could possibly drastically improve the world loading performance. In theory, this could even be merged into the world
-when embedding SHARDs as schematics, rendering most (if not all) light updates redundant.
-
-Including light data in SHARDs increases the complexity of most transformation operations and especially the merging of
-SHARDs. To reliably modify light data during those operations, we would need to implement details about how light data
-is populated. That is a huge maintenance burden. Alternatively, we could just drop any light data once a modification
-has been applied to the SHARD.
 
 
 [justchunks-website]: https://justchunks.net/
